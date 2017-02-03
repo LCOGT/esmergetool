@@ -29,6 +29,11 @@ This code is written for Python 2.7.
 The Python installation dependencies are specified in `requirements.txt`, and
 only consist of the Official Elasticsearch Python API.
 
+Known Limitations
+=================
+
+- Does not copy field mappings from the source indices to the destination index
+
 Command Line Interface
 ======================
 
