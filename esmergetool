@@ -1,0 +1,723 @@
+#!/bin/env python
+# vim: set ts=4 sts=4 sw=4 et:
+
+'''
+Merge several Elasticsearch indices into a single combined index
+using the Elasticsearch Reindex API (available in Elasticseach >= 2.4).
+'''
+
+import os
+import sys
+import json
+import time
+import uuid
+import argparse
+import datetime
+import platform
+import collections
+
+import elasticsearch
+
+DEFAULT_STATUS_INDEX = 'esmergetool-status'
+
+def jsonify(document, pretty=False, sort_keys=False):
+    '''Turn a Python dictionary into JSON'''
+    if pretty:
+        return json.dumps(document, sort_keys=sort_keys, indent=4, separators=(',', ': '))
+
+    return json.dumps(document)
+
+def main():
+    '''Main entrypoint to this program'''
+
+    description = '''A Tool to combine many Elasticsearch indices into a single combined index'''
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--host', help='Elasticsearch cluster host(s) (comma separated)')
+    parser.add_argument('-n', '--dry-run', help='Do not perform any action', action='store_true')
+    parser.add_argument('-y', '--yes', help='Assume a yes answer to any prompt', action='store_true')
+    parser.add_argument('-s', '--source-index-pattern', help='Source indices pattern')
+    parser.add_argument('-d', '--destination-index', help='Destination index')
+    parser.add_argument('-r', '--resume', help='Continue a previous job matching these parameters', action='store_true')
+    parser.add_argument('--set-source-readonly', help='Set source indices read-only as we finish with them', action='store_true')
+    parser.add_argument('--set-destination-readonly', help='Set destination index read-only when complete', action='store_true')
+    parser.add_argument('--status-index', default=DEFAULT_STATUS_INDEX, help='Override default status index (default: {})'.format(DEFAULT_STATUS_INDEX))
+
+    args = parser.parse_args()
+    #print 'ARGS:', args
+
+    mergetool = MergeTool(args)
+    mergetool.confirm_with_user()
+    mergetool.run_reindex_job_to_completion()
+    sys.exit(0)
+
+ReindexTaskStatus = collections.namedtuple(
+    'ReindexTaskStatus',
+    [ 'running', 'runtime', 'total', 'created', 'updated', 'deleted', ]
+)
+
+IndexInformation = collections.namedtuple(
+    'IndexInformation',
+    [ 'name', 'count', 'closed', ]
+)
+
+class StatusDocument(object):
+    '''
+    A class to hold all status information about a running merge job.
+    The class can be persisted to the Elasticsearch database, and restored
+    so that jobs may be interrupted and then resumed.
+    '''
+
+    # the document id (as stored in Elasticsearch)
+    document_id = ''
+
+    # the list of source indices to merge from
+    source_indices = []
+
+    # the destination index to merge into
+    destination_index = ''
+
+    # the current source index being merged
+    current_source_index = ''
+
+    # the current Elasticsearch Task ID (for the Tasks API)
+    current_reindex_taskid = ''
+
+    # automatically re-close source index when finished
+    close_source_when_finished = False
+
+    # process status (to record crash information)
+    hostname = platform.node()
+    pid = os.getpid()
+    status = ''
+    message = ''
+    last_update = ''
+
+    def __init__(self):
+        pass
+
+    def __repr__(self):
+        return 'StatusDocument id=%s %s' % (self.document_id, self.tojson(pretty=True, sort_keys=True))
+
+    def tojson(self, pretty=False, sort_keys=False):
+        '''Convert status document to JSON for Elasticsearch'''
+        # automatically update the timestamp every time we save to the database
+        self.last_update = datetime.datetime.utcnow().strftime('%s')
+
+        # automatically update hostname/pid every time we save to the database
+        self.hostname = platform.node()
+        self.pid = os.getpid()
+
+        body = {
+            'source_indices': sorted(self.source_indices),
+            'destination_index': self.destination_index,
+            'current_source_index': self.current_source_index,
+            'current_reindex_taskid': self.current_reindex_taskid,
+            'close_source_when_finished': self.close_source_when_finished,
+            'hostname': self.hostname,
+            'pid': self.pid,
+            'status': self.status,
+            'message': self.message,
+            'last_update': self.last_update,
+        }
+
+        return jsonify(body, pretty=pretty, sort_keys=sort_keys)
+
+    def fromjson(self, doc):
+        '''Convert JSON Elasticsearch document into status document'''
+        source = doc['_source']
+
+        self.document_id = doc['_id']
+        self.source_indices = sorted(source['source_indices'])
+        self.destination_index = source['destination_index']
+        self.current_source_index = source['current_source_index']
+        self.current_reindex_taskid = source['current_reindex_taskid']
+        self.close_source_when_finished = source['close_source_when_finished']
+        self.hostname = source['hostname']
+        self.pid = source['pid']
+        self.status = source['status']
+        self.message = source['message']
+        self.last_update = source['last_update']
+
+    def fromargs(self, args, source_indices):
+        '''Convert Command Line Arguments into status document'''
+        self.document_id = uuid.uuid4()
+        self.source_indices = sorted(source_indices)
+        self.destination_index = args.destination_index
+        self.current_source_index = ''
+        self.current_reindex_taskid = ''
+        self.close_source_when_finished = False
+        self.hostname = platform.node()
+        self.pid = os.getpid()
+        self.status = 'OK'
+        self.message = ''
+        self.last_update = datetime.datetime.utcnow().strftime('%s')
+
+    def matches(self, source_indices, destination_index):
+        '''Does this document match the specified parameters?'''
+        return sorted(self.source_indices) == sorted(source_indices) and self.destination_index == destination_index
+
+    def get_next_source_index(self):
+        '''Get the next source index that will be merged from'''
+        # no index set, start at the beginning
+        if self.current_source_index == '':
+            return self.source_indices[0]
+
+        try:
+            # find the list index of the current source index
+            idx = self.source_indices.index(self.current_source_index)
+
+            # return the next item in the list
+            return self.source_indices[idx + 1]
+        except ValueError:
+            raise RuntimeError('BUG: current_source_index not found in source_indices')
+        except IndexError:
+            # we are out of stuff to do!
+            return ''
+
+    def is_job_active_within_nseconds(self, seconds):
+        '''Check to see if the job was active within the last N seconds'''
+        now = int(datetime.datetime.utcnow().strftime('%s'))
+        prev = int(self.last_update)
+        return abs(now - prev) <= seconds
+
+class MergeTool(object):
+    '''
+    A class to control all aspects of merging several Elasticsearch indices
+    into a single combined index.
+    '''
+
+    # elasticsearch connection object
+    elasticsearch = None
+
+    # command line arguments
+    args = None
+
+    # status document
+    statusdocument = StatusDocument()
+
+    def __init__(self, args):
+        self.args = args
+
+        hosts = self.args.host.split(',')
+        hosts = [elem.strip() for elem in hosts]
+        self.elasticsearch = elasticsearch.Elasticsearch(hosts=hosts)
+
+    def response_is_success(self, response):
+        '''Check to see if an Elasticsearch response was successful'''
+        # A successful response is: {u'acknowledged': True}
+        return response is not None and response.get('acknowledged', False)
+
+    def index_exists(self, name):
+        '''
+        Check to see if an Elasticsearch index exists
+
+        Note that the index may be closed, and need to be opened before any
+        operations can be performed.
+        '''
+        return self.elasticsearch.indices.exists(index=name, expand_wildcards='all')
+
+    def index_is_open(self, name):
+        '''Check to see if an Elasticsearch index is open or closed'''
+        try:
+            self.elasticsearch.indices.stats(index=name)
+            return True
+        except elasticsearch.TransportError, ex:
+            if ex.error == 'index_closed_exception':
+                return False
+
+            # don't know about this specific exception, re-raise
+            raise
+
+    def optimize_index(self, index):
+        '''Optimize an index using the Elasticsearch ForceMerge API'''
+        response = self.elasticsearch.indices.forcemerge(index=index)
+        return response
+
+    def set_index_readwrite(self, name):
+        '''Configure an index into read/write mode'''
+        body = {
+            "settings": {
+                "index": {
+                    "blocks": {
+                        "read_only": False,
+                    },
+                },
+            },
+        }
+
+        response = self.elasticsearch.indices.put_settings(index=self.args.destination_index, body=jsonify(body))
+        if not self.response_is_success(response):
+            raise Exception('Unable to set index %s into read-write mode' % (name, ))
+
+    def set_index_readonly(self, name):
+        '''Configure an index into read only mode'''
+        body = {
+            "settings": {
+                "index": {
+                    "blocks": {
+                        "read_only": True,
+                    },
+                },
+            },
+        }
+
+        response = self.elasticsearch.indices.put_settings(index=self.args.destination_index, body=jsonify(body))
+        if not self.response_is_success(response):
+            raise Exception('Unable to set index %s into read-only mode' % (name, ))
+
+    def indices_matching_pattern(self, pattern):
+        '''
+        Get a list of Elasticsearch indices matching a specific pattern
+
+        Note that any of the indices may be closed, and therefore need to
+        be opened before any operations can be performed.
+        '''
+        try:
+            return sorted(self.elasticsearch.indices.get(index=pattern, expand_wildcards='all').keys())
+        except elasticsearch.exceptions.NotFoundError:
+            return []
+
+    def create_status_index(self):
+        '''Create an index to hold status updates from this program'''
+
+        if self.index_exists(self.args.status_index):
+            return
+
+        body = {
+            "settings": {
+                "index": {
+                    "refresh_interval": "1s",
+                    "number_of_shards": "1",
+                    "number_of_replicas": "1",
+                },
+            },
+        }
+
+        response = self.elasticsearch.indices.create(index=self.args.status_index, body=jsonify(body))
+        if not self.response_is_success(response):
+            raise Exception("Unable to create index: {}".format(self.args.status_index))
+
+    def find_previous_matching_job(self, source_indices):
+        '''Search the status index for an existing job matching the command line parameters'''
+        # if the status index does not exist, then there is no previous job possible
+        if not self.index_exists(self.args.status_index):
+            return None
+
+        # run a generic "get all documents" search, since elasticsearch
+        # can't seem to handle searching for an exact match of a list
+        response = self.elasticsearch.search(index=self.args.status_index, size=1000)
+
+        documents = []
+        try:
+            documents = response['hits']['hits']
+        except KeyError:
+            pass
+
+        # search for a document with a matching set of source and destination indices
+        for doc in documents:
+            tmp = StatusDocument()
+            tmp.fromjson(doc)
+            if tmp.matches(source_indices, self.args.destination_index):
+                return tmp
+
+        return None
+
+    def update_status_document(self):
+        '''Send an updated version of the StatusDocument to elasticsearch'''
+
+        # send the document to elasticsearch
+        response = self.elasticsearch.index(
+            index=self.args.status_index,
+            doc_type='status',
+            id=self.statusdocument.document_id,
+            body=self.statusdocument.tojson()
+        )
+
+        return response
+
+    def delete_status_document(self):
+        '''Remove the status document'''
+        self.elasticsearch.delete(
+            index=self.args.status_index,
+            doc_type='status',
+            id=self.statusdocument.document_id
+        )
+
+    def create_and_configure_destination_index(self):
+        '''Create the destination index and configure settings to increase reindex speed'''
+
+        # these settings provide roughly optimal indexing speed without
+        # overriding too many defaults
+        body = {
+            "settings": {
+                "index": {
+                    "codec": "best_compression",
+                    "refresh_interval": "120s",
+                    "number_of_replicas": "0",
+                },
+            },
+        }
+
+        # create the index if it doesn't exist
+        if not self.index_exists(self.args.destination_index):
+            print 'Creating destination index:', self.args.destination_index
+            response = self.elasticsearch.indices.create(index=self.args.destination_index, body=jsonify(body))
+            if not self.response_is_success(response):
+                raise Exception("Unable to create index: {}".format(self.args.destination_index))
+
+        # configure destination index in read-write mode
+        print 'Configuring destination index in read-write mode'
+        self.set_index_readwrite(self.args.destination_index)
+
+        # and now configure the index for maximum indexing speed
+        print 'Configuring destination index for maximum indexing speed'
+
+        # remove the compression setting (you can only set it during creation)
+        del body['settings']['index']['codec']
+
+        response = self.elasticsearch.indices.put_settings(index=self.args.destination_index, body=jsonify(body))
+        if not self.response_is_success(response):
+            raise Exception('Unable to configure destination index settings')
+
+    def finalize_destination_index_settings(self):
+        '''
+        Reset the configuration of the destination index back to sane
+        values suitable for long term storage. This makes the index read-only.
+        '''
+        self.optimize_index(self.args.destination_index)
+
+        body = {
+            "settings": {
+                "index": {
+                    "refresh_interval": "30s",
+                    "number_of_replicas": "1",
+                },
+            },
+        }
+
+        response = self.elasticsearch.indices.put_settings(index=self.args.destination_index, body=jsonify(body))
+        if not self.response_is_success(response):
+            raise Exception('Unable to configure destination index settings')
+
+    def begin_next_reindex_in_background(self):
+        '''
+        Begin the reindex job with the next segment that needs to be processed.
+        The reindex operation will run in the background, and can be monitored
+        by polling using the Elasticsearch Tasks API.
+        '''
+        # automatically close the previous source index if it was automatically opened
+        if self.statusdocument.close_source_when_finished and self.statusdocument.current_source_index != '':
+            print 'Automatically re-closing source index:', self.statusdocument.current_source_index
+            response = self.elasticsearch.indices.close(index=self.statusdocument.current_source_index)
+            if not self.response_is_success(response):
+                raise Exception('Automatic close of source index %s failed' % (self.statusdocument.current_source_index, ))
+
+        # find next source and destination indices
+        src = self.statusdocument.get_next_source_index()
+        dst = self.args.destination_index
+
+        # check to see if the reindex is complete
+        if src == '':
+            print 'Reindex is already complete'
+            return
+
+        # automatically open closed indices
+        if not self.index_is_open(src):
+            print 'Automatically open source index:', src
+            self.statusdocument.close_source_when_finished = True
+            response = self.elasticsearch.indices.open(index=src)
+            if not self.response_is_success(response):
+                raise Exception('Automatic open of source index %s failed' % (src, ))
+
+            # need to sleep to give elasticsearch time to successfully open the index,
+            # otherwise the reindex silently fails
+            time.sleep(5.0)
+
+        # if requested, set the source index to read only before proceeding
+        if self.args.set_source_readonly:
+            self.set_index_readonly(src)
+
+        body = {
+            "source": {
+                "index": src,
+            },
+            "dest": {
+                "index": dst,
+                "version_type": "external",
+            },
+            "conflicts": "proceed",
+        }
+
+        print 'Begin Background Reindex: src={} dst={}'.format(src, dst)
+
+        response = self.elasticsearch.reindex(body=jsonify(body), wait_for_completion=False)
+
+        # update the status document with the current reindexing status
+        self.statusdocument.current_source_index = src
+        self.statusdocument.current_reindex_taskid = response.get('task', 'UNKNOWN')
+        self.statusdocument.status = 'OK'
+        self.statusdocument.message = 'Running reindex of source %s' % (src, )
+        self.update_status_document()
+
+        # update our user on progress
+        print 'Elasticsearch reindex task id:', self.statusdocument.current_reindex_taskid
+
+    def get_reindex_task_status(self):
+        '''
+        Get information about an ongoing reindex task.
+        Returns a ReindexTaskStatus object.
+        '''
+
+        response = {}
+        running = False
+
+        # we can't get the status if there is no task id
+        if self.statusdocument.current_reindex_taskid != '':
+            response = self.elasticsearch.tasks.list(task_id=self.statusdocument.current_reindex_taskid, detailed=True)
+            running = len(response.get('nodes')) >= 1
+
+        # try to get the task status
+        task = {}
+        try:
+            taskid_full = self.statusdocument.current_reindex_taskid
+            taskid_short = taskid_full.split(':')[0]
+            task = response['nodes'][taskid_short]['tasks'][taskid_full]
+        except KeyError:
+            pass
+
+        # extract running time
+        runtime = task.get('running_time_in_nanos', 0.0) / 1000.0 / 1000.0 / 1000.0
+
+        # extract statistics
+        status = task.get('status', {})
+        total = status.get('total', 0)
+        created = status.get('created', 0)
+        updated = status.get('updated', 0)
+        deleted = status.get('deleted', 0)
+
+        return ReindexTaskStatus(
+            running=running,
+            runtime=runtime,
+            total=total,
+            created=created,
+            updated=updated,
+            deleted=deleted
+        )
+
+    def is_entire_reindex_job_complete(self):
+        '''
+        Check if an entire reindex job is complete
+
+        This checks that all source indices have been merged successfully
+        into the destination index.
+        '''
+        # if the current reindex is still running, then we are not done yet
+        taskstatus = self.get_reindex_task_status()
+        if taskstatus.running:
+            return False
+
+        # there is a next source to reindex, we are not complete yet
+        if self.statusdocument.get_next_source_index() != '':
+            return False
+
+        return True
+
+    def wait_for_reindex_task_to_finish(self, pollinterval=1.0):
+        '''
+        Wait for a single reindex task to finish.
+
+        Parameters:
+        - pollinterval: the polling interval (in seconds)
+
+        Information will be printed to the screen on each iteration through
+        the polling loop.
+        '''
+        while True:
+            # the reindex task is finished, we can stop polling
+            taskstatus = self.get_reindex_task_status()
+            if not taskstatus.running:
+                return
+
+            # calculate statistics about the running reindex task
+            done = taskstatus.created + taskstatus.updated + taskstatus.deleted
+            total = taskstatus.total
+
+            try:
+                pct = (float(done) / float(total)) * 100.0
+            except ZeroDivisionError:
+                pct = 0.0
+
+            print 'Reindex is running (source_index: %s, runtime: %.2f seconds, %d/%d => %.2f%% complete)' % (
+                self.statusdocument.current_source_index,
+                taskstatus.runtime,
+                done,
+                total,
+                pct,
+            )
+
+            # update the status document and sleep before the next poll
+            self.update_status_document()
+            time.sleep(pollinterval)
+
+    def run_reindex_job_to_completion(self):
+        '''
+        Run an entire reindex job to completion
+
+        This will handle both new and resumed jobs. A best effort is made to
+        record information about any problems that happen during the job, so
+        that problems can be diagnosed before the job is resumed.
+        '''
+        try:
+            self.update_status_document()
+            self.create_and_configure_destination_index()
+
+            while not self.is_entire_reindex_job_complete():
+                # wait for previous task to complete before starting next task
+                self.wait_for_reindex_task_to_finish()
+
+                # we're not done yet, start the next segment
+                if not self.is_entire_reindex_job_complete():
+                    self.begin_next_reindex_in_background()
+
+            print 'Reindex job is complete, optimize and reconfigure destination index settings'
+            self.finalize_destination_index_settings()
+
+            if self.args.set_destination_readonly:
+                self.set_index_readonly(self.statusdocument.destination_index)
+
+            self.delete_status_document()
+        except KeyboardInterrupt, ex:
+            self.statusdocument.status = 'KEYBOARDINTERRUPT'
+            self.statusdocument.message = 'Interrupted by user'
+            self.update_status_document()
+            sys.exit(1)
+        except Exception, ex:
+            self.statusdocument.status = 'CRASHED'
+            self.statusdocument.message = str(ex)
+            self.update_status_document()
+            raise
+
+    def str_index_information(self, name):
+        '''
+        Get a string representation of various important information about
+        a specific Elasticsearch index
+        '''
+        # index does not exist, cannot provide any information
+        if not self.index_exists(name):
+            return '%s (count=N/A, closed=N/A)' % (name, )
+
+        # index is not open, we cannot get the document count
+        if not self.index_is_open(name):
+            return '%s (count=N/A, closed=True)' % (name, )
+
+        # index is ready to go, get all available information
+        count = self.elasticsearch.count(index=name)['count']
+        return '%s (count=%d, closed=False)' % (name, count, )
+
+    def confirm_with_user(self):
+        '''
+        Confirm the settings with the user, or exit
+
+        Print a big list of what is going to happen during the reindex job.
+        This includes possible error cases and things that we can handle, but
+        that the user should be aware of before starting the reindex job.
+        '''
+        # get the list of source indices that we will operate upon
+        source_indices = self.indices_matching_pattern(self.args.source_index_pattern)
+        destination_index = self.args.destination_index
+
+        # try to find any previous job with matching parameters
+        statusdocument = self.find_previous_matching_job(source_indices)
+
+        # generate a list of additional actions that this program will
+        # perform that the user should be notified about
+        additionalactions = []
+        additionalactions.append('Source indices will be automatically opened (if necessary) during merge')
+        if self.args.set_source_readonly:
+            additionalactions.append('Source indices will be set to read-only before merge')
+
+        if not self.index_exists(self.args.destination_index):
+            additionalactions.append('Destination index will be created')
+
+        if self.args.set_destination_readonly:
+            additionalactions.append('Destination index will be set to read-only after merge')
+
+        if not self.index_exists(self.args.status_index):
+            additionalactions.append('Index %s will be created to store job status' % (self.args.status_index, ))
+
+        # generate a list of warnings that the user should be made aware of
+        warnings = []
+        if self.index_exists(destination_index):
+            warnings.append('Destination index already exists: reindex may be slow or fail completely')
+
+        # lots of warnings about existing jobs that may collide
+        if statusdocument:
+            if statusdocument.is_job_active_within_nseconds(60):
+                warnings.append('Existing identical job exists, and WAS ACTIVE within the last 60 seconds')
+            else:
+                warnings.append('Existing identical job exists, and WAS NOT ACTIVE within the last 60 seconds')
+
+            warnings.append('Existing identical job claims to be running on host {} with pid {}'.format(statusdocument.hostname, statusdocument.pid))
+            warnings.append('Existing identical job status code is: {}'.format(statusdocument.status))
+            warnings.append('Existing identical job message is: {}'.format(statusdocument.message))
+
+        # print everything so that the user can read it and confirm
+        print 'YOU MUST CONFIRM THAT THIS INFORMATION IS CORRECT BEFORE PROCEEDING:'
+        print
+        print 'Source Indices:'
+        for name in source_indices:
+            print '-', self.str_index_information(name)
+        print
+        print 'Destination Index:'
+        print '-', self.str_index_information(destination_index)
+        if len(additionalactions) > 0:
+            print
+            print 'Additional Actions:'
+            for elem in additionalactions:
+                print '-', elem
+        if len(warnings) > 0:
+            print
+            print 'Warnings:'
+            for elem in warnings:
+                print '-', elem
+
+        # previous job found and resume flag not given, abort
+        if statusdocument and not self.args.resume:
+            print
+            print 'Previous job found, but --resume flag not present. Exiting now.'
+            sys.exit(1)
+
+        # dry run, exit now
+        if self.args.dry_run:
+            print
+            print 'Dry run requested, exiting now.'
+            sys.exit(0)
+
+        # user requested that we confirm settings with them interactively
+        if self.args.yes:
+            print
+            print 'Confirmation automatically given by command line option'
+        else:
+            print
+            response = raw_input('Please confirm by typing "y" now: ')
+            response = response.lower().strip()
+            if response != 'y':
+                print 'Confirmation not given, exiting now'
+                sys.exit(1)
+            print 'Confirmation given interactively by user'
+
+        # we need one more extra line to make the output look nice
+        print
+
+        # confirmation received, we should create the status document for the job now
+        if not statusdocument:
+            statusdocument = StatusDocument()
+            statusdocument.fromargs(self.args, source_indices)
+
+        # save the status document into the elasticsearch database
+        self.create_status_index()
+        self.statusdocument = statusdocument
+        self.update_status_document()
+
+if __name__ == '__main__':
+    main()
