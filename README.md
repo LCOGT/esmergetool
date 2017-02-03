@@ -21,10 +21,10 @@ This tool was written to support large merge jobs. This includes support for:
 Dependencies
 ============
 
-The Python installation dependencies are specified in `requirements.txt`, and
-only consist of the Official Elasticsearch Python API.
+This tool uses the [Elasticsearch Reindex API](https://www.elastic.co/guide/en/elasticsearch/reference/2.4/docs-reindex.html),
+which is only available in Elasticsearch 2.4 and newer.
 
 This code is written for Python 2.7.
 
-This tool uses the [Elasticsearch Reindex API](https://www.elastic.co/guide/en/elasticsearch/reference/2.4/docs-reindex.html),
-which is only available in Elasticsearch 2.4 and newer.
+The Python installation dependencies are specified in `requirements.txt`, and
+only consist of the Official Elasticsearch Python API.
