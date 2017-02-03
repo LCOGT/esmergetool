@@ -28,3 +28,33 @@ This code is written for Python 2.7.
 
 The Python installation dependencies are specified in `requirements.txt`, and
 only consist of the Official Elasticsearch Python API.
+
+Command Line Interface
+======================
+
+The command line interface help output is reproduced below:
+
+    usage: esmergetool [-h] [--host HOST] [-n] [-y] [-s SOURCE_INDEX_PATTERN]
+                       [-d DESTINATION_INDEX] [-r] [--set-source-readonly]
+                       [--set-destination-readonly] [--status-index STATUS_INDEX]
+
+    A Tool to combine many Elasticsearch indices into a single combined index
+
+    optional arguments:
+      -h, --help            show this help message and exit
+      --host HOST           Elasticsearch cluster host(s) (comma separated)
+      -n, --dry-run         Do not perform any action
+      -y, --yes             Assume a yes answer to any prompt
+      -s SOURCE_INDEX_PATTERN, --source-index-pattern SOURCE_INDEX_PATTERN
+                            Source indices pattern
+      -d DESTINATION_INDEX, --destination-index DESTINATION_INDEX
+                            Destination index
+      -r, --resume          Continue a previous job matching these parameters
+      --set-source-readonly
+                            Set source indices read-only as we finish with them
+      --set-destination-readonly
+                            Set destination index read-only when complete
+      --status-index STATUS_INDEX
+                            Override default status index (default: esmergetool-
+                            status)
+
