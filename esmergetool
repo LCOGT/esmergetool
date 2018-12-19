@@ -473,15 +473,15 @@ class MergeTool(object):
 
         # we can't get the status if there is no task id
         if self.statusdocument.current_reindex_taskid != '':
-            response = self.elasticsearch.tasks.list(task_id=self.statusdocument.current_reindex_taskid, detailed=True)
-            running = len(response.get('nodes')) >= 1
+            response = self.elasticsearch.tasks.get(task_id=self.statusdocument.current_reindex_taskid)
+            running = not response.get('completed', False)
 
         # try to get the task status
         task = {}
         try:
             taskid_full = self.statusdocument.current_reindex_taskid
             taskid_short = taskid_full.split(':')[0]
-            task = response['nodes'][taskid_short]['tasks'][taskid_full]
+            task = response.get('task', {})
         except KeyError:
             pass
 
