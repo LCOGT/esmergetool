@@ -472,23 +472,21 @@ class MergeTool(object):
         '''
 
         response = {}
-        running = False
+        completed = True
 
         # we can't get the status if there is no task id
         if self.statusdocument.current_reindex_taskid != '':
             response = self.elasticsearch.tasks.get(task_id=self.statusdocument.current_reindex_taskid)
-            running = not response.get('completed', False)
+            completed = response.get('completed', True)
 
         # try to get the task status
         task = {}
         try:
-            taskid_full = self.statusdocument.current_reindex_taskid
-            taskid_short = taskid_full.split(':')[0]
             task = response.get('task', {})
         except KeyError:
             pass
 
-        # extract running time
+        # extract runtime
         runtime = task.get('running_time_in_nanos', 0.0) / 1000.0 / 1000.0 / 1000.0
 
         # extract statistics
@@ -498,8 +496,9 @@ class MergeTool(object):
         updated = status.get('updated', 0)
         deleted = status.get('deleted', 0)
 
+        # return the summed values to the caller
         return ReindexTaskStatus(
-            running=running,
+            running=not completed,
             runtime=runtime,
             total=total,
             created=created,
