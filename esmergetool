@@ -33,6 +33,7 @@ def main():
     description = '''A Tool to combine many Elasticsearch indices into a single combined index'''
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--host', help='Elasticsearch cluster host(s) (comma separated)')
+    parser.add_argument('-t', '--timeout', help='Elasticsearch client timeout', type=int, default=600)
     parser.add_argument('-n', '--dry-run', help='Do not perform any action', action='store_true')
     parser.add_argument('-y', '--yes', help='Assume a yes answer to any prompt', action='store_true')
     parser.add_argument('-s', '--source-index-pattern', help='Source indices pattern')
@@ -200,7 +201,7 @@ class MergeTool(object):
 
         hosts = self.args.host.split(',')
         hosts = [elem.strip() for elem in hosts]
-        self.elasticsearch = elasticsearch.Elasticsearch(hosts=hosts)
+        self.elasticsearch = elasticsearch.Elasticsearch(hosts=hosts, timeout=self.args.timeout)
 
     def response_is_success(self, response):
         '''Check to see if an Elasticsearch response was successful'''
