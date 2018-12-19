@@ -34,6 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--host', help='Elasticsearch cluster host(s) (comma separated)')
     parser.add_argument('-t', '--timeout', help='Elasticsearch client timeout', type=int, default=600)
+    parser.add_argument('-b', '--reindex-batch-size', help='Reindex Batch Size', type=int, default=10000)
     parser.add_argument('-n', '--dry-run', help='Do not perform any action', action='store_true')
     parser.add_argument('-y', '--yes', help='Assume a yes answer to any prompt', action='store_true')
     parser.add_argument('-s', '--source-index-pattern', help='Source indices pattern')
@@ -441,6 +442,7 @@ class MergeTool(object):
         body = {
             "source": {
                 "index": src,
+                "size": self.args.reindex_batch_size,
             },
             "dest": {
                 "index": dst,
