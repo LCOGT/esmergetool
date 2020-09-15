@@ -263,7 +263,7 @@ class MergeTool(object):
             },
         }
 
-        response = self.elasticsearch.indices.put_settings(index=self.args.destination_index, body=jsonify(body))
+        response = self.elasticsearch.indices.put_settings(index=name, body=jsonify(body))
         if not self.response_is_success(response):
             raise Exception('Unable to set index %s into read-only mode' % (name, ))
 
